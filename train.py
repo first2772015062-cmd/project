@@ -1,31 +1,39 @@
+from __future__ import annotations
+
 import argparse
 import json
 import random
 from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from PIL import Image
 
 from models import build_model, count_trainable_parameters
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train and evaluate CNN or ResNet on MNIST.")
-    parser.add_argument("--model", choices=["cnn", "resnet"], default="cnn", help="Model architecture to train.")
+def parse_args(default_model: str = "cnn", argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="基于深度学习的 MNIST 数字图片分类项目。")
+    parser.add_argument("--model", choices=["cnn", "resnet"], default=default_model, help="选择模型结构。")
     parser.add_argument("--data-dir", default="./data", help="Directory that stores MNIST.")
     parser.add_argument("--output-dir", default="./outputs", help="Directory for checkpoints and metrics.")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--learning-rate", type=float, default=0.001)
+    parser.add_argument("--learning-rate", type=float, default=0.0001)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--download", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--download", dest="download", action="store_true", default=True)
+    parser.add_argument("--no-download", dest="download", action="store_false")
     parser.add_argument("--limit-train-batches", type=int, default=None, help="Optional quick-run limit.")
     parser.add_argument("--limit-test-batches", type=int, default=None, help="Optional quick-run limit.")
-    return parser.parse_args()
+    parser.add_argument("--predict-image", default=None, help="Optional image path for single-image prediction.")
+    parser.add_argument("--export-images", action="store_true", help="Export MNIST train/test data as PNG images.")
+    parser.add_argument("--image-output-dir", default="./MNIST", help="Directory for exported MNIST PNG images.")
+    return parser.parse_args(argv)
 
 
 def set_seed(seed: int) -> None:
@@ -58,13 +66,29 @@ def make_dataloaders(args: argparse.Namespace) -> tuple[DataLoader, DataLoader]:
     return train_loader, test_loader
 
 
+def export_mnist_images(data_dir: str, output_dir: str, download: bool = True) -> None:
+    train_dataset = datasets.MNIST(root=data_dir, train=True, download=download, transform=transforms.ToTensor())
+    test_dataset = datasets.MNIST(root=data_dir, train=False, download=download, transform=transforms.ToTensor())
+
+    def save_images(dataset: datasets.MNIST, folder: Path) -> None:
+        folder.mkdir(parents=True, exist_ok=True)
+        for index, (image, label) in enumerate(zip(dataset.data, dataset.targets)):
+            image_path = folder / f"{index}_label_{int(label)}.png"
+            Image.fromarray(image.numpy(), mode="L").save(image_path)
+        print(f"Saved {len(dataset.data)} images to {folder}")
+
+    root = Path(output_dir)
+    save_images(train_dataset, root / "mnist_train")
+    save_images(test_dataset, root / "mnist_test")
+
+
 def run_epoch(
     model: nn.Module,
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
-    optimizer: torch.optim.Optimizer | None = None,
-    max_batches: int | None = None,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    max_batches: Optional[int] = None,
 ) -> tuple[float, float]:
     is_training = optimizer is not None
     model.train(is_training)
@@ -124,9 +148,39 @@ def save_artifacts(
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
 
-def main() -> None:
-    args = parse_args()
+def load_checkpoint(model_name: str, checkpoint_path: Path, device: torch.device) -> nn.Module:
+    model = build_model(model_name, num_classes=10).to(device)
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+def predict_image(model: nn.Module, image_path: str, device: torch.device) -> int:
+    transform = transforms.Compose(
+        [
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((28, 28)),
+            transforms.ToTensor(),
+        ]
+    )
+    image = Image.open(image_path).convert("L")
+    image_tensor = transform(image).unsqueeze(0).to(device)
+
+    model.eval()
+    with torch.no_grad():
+        logits = model(image_tensor)
+        prediction = logits.argmax(dim=1)
+    return int(prediction.item())
+
+
+def main(default_model: str = "cnn", argv: Optional[List[str]] = None) -> None:
+    args = parse_args(default_model=default_model, argv=argv)
     set_seed(args.seed)
+
+    if args.export_images:
+        export_mnist_images(args.data_dir, args.image_output_dir, download=args.download)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = make_dataloaders(args)
@@ -189,6 +243,12 @@ def main() -> None:
     save_artifacts(model, args, metrics, parameter_count, Path(args.output_dir))
     print(f"trainable_parameters={parameter_count}")
     print(f"best_test_accuracy={best_test_accuracy:.4f}")
+
+    if args.predict_image:
+        checkpoint_path = Path(args.output_dir) / f"{args.model}.pth"
+        trained_model = load_checkpoint(args.model, checkpoint_path, device)
+        prediction = predict_image(trained_model, args.predict_image, device)
+        print(f"Predicted: {prediction}")
 
 
 if __name__ == "__main__":
